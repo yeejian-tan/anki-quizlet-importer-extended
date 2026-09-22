@@ -40,8 +40,15 @@ from aqt import mw
 import os
 import sys
 import logging
+import threading
+import time
 import urllib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.cookies import SimpleCookie
+
+from anki.collection import AddNoteRequest
+from anki.decks import DeckId
+from aqt.operations import CollectionOp, QueryOp
 try:
     import urllib2
     URLError = urllib2.URLError
@@ -50,11 +57,6 @@ except Exception:
     import urllib.error
     URLError = urllib.error.URLError
     
-try:
-    from PyQt6.QtCore import pyqtSignal
-except Exception:
-    from PyQt5.QtCore import pyqtSignal
-
 ADDON_DIR = os.path.dirname(__file__)
 VENDOR_DIR = os.path.join(ADDON_DIR, "vendor")
 
@@ -93,6 +95,10 @@ context.verify_mode = ssl.CERT_NONE
 urllib2.install_opener(urllib2.build_opener(urllib2.HTTPSHandler(context=context)))
 
 public_api_key = '0b8aa35d-b521-4fe0-bf0e-2ae07d826acf'
+
+# How many media files to fetch at once. Each tls_requests call builds its own
+# session, so these run independently; override with "media_workers" in config.
+DEFAULT_MEDIA_WORKERS = 6
 
 
 def get_cookies():
@@ -180,8 +186,6 @@ class QuizletWindow(QWidget):
     def __init__(self):
         super(QuizletWindow, self).__init__()
 
-        self.results = None
-        self.thread = None
         self.config = mw.addonManager.getConfig(__name__)
 
         self.initGUI()
@@ -405,202 +409,419 @@ Note: 'Page html' does not support Quizlet folder import
 
         return quizletDeckID
 
-    def FolderExtract(self, page_html):
-            # Extract studyMaterialId values from the page HTML
-            ids = re.findall(r'"studyMaterialId":"(\d+)"', page_html)
-            for id in ids:
-                #url = "https://quizlet.com/{}/flashcards".format(id)
-                self.label_results.setText(f'Downloading deck {ids.index(id)+1}/{len(ids)}')
-                quizletDeckID = id
-                self.onCode(quizletDeckID)
+    def snapshotOptions(self):
+        """Read everything the import needs off the widgets and the collection.
 
+        The background threads must not touch Qt or mw.col, so every value they
+        rely on is captured here, on the main thread, before the op starts.
+        """
+        return {
+            "html": self.value_incoming_html.toPlainText(),
+            "download_audio": self.value_download_audio.isChecked(),
+            "add_reverse": self.value_add_reverse.isChecked(),
+            "skip_errors": self.value_skip_errors.isChecked(),
+            "start_phrase": self.value_start_phrase.text(),
+            "stop_phrase": self.value_stop_phrase.text(),
+            "cookies": get_cookies(),
+            "license": self.config.get("license", public_api_key),
+            "media_dir": mw.col.media.dir(),
+            "media_workers": max(1, int(self.config.get("media_workers", DEFAULT_MEDIA_WORKERS))),
+        }
 
+    def setBusy(self, busy):
+        self.button_code.setEnabled(not busy)
 
+    def onCode(self, _checked=False):
+        """Import button handler. Starts the download and returns immediately."""
+        quizletDeckID = self.getQuizletDeckID()
 
-    def onCode(self, quizletDeckID):
-        html = self.value_incoming_html.toPlainText()
-        if quizletDeckID == False:
-            self.label_results.setText("Connecting to Quizlet...")
-            quizletDeckID = self.getQuizletDeckID()
+        if quizletDeckID is None:
+            return
 
-
-        if type(quizletDeckID) != int:
-            if quizletDeckID == None:
-                return
-            elif quizletDeckID == 'folder':
-                deck_url = self.text_url.text()
-            else:
-                # build URL
-                deck_url = "https://quizlet.com/{}/flashcards".format(quizletDeckID)
+        if quizletDeckID == 'folder':
+            deck_url = self.text_url.text()
         else:
             deck_url = "https://quizlet.com/{}/flashcards".format(quizletDeckID)
 
-        # and aaawaaaay we go...
+        opts = self.snapshotOptions()
+        self.setBusy(True)
+        self.label_results.setText("Connecting to Quizlet...")
 
+        QueryOp(
+            parent=self,
+            op=lambda col: fetchEverything(deck_url, quizletDeckID, opts),
+            success=self.onFetched,
+        ).failure(self.onFetchFailed).with_progress("Connecting to Quizlet...").run_in_background()
 
-        # download the data!
-        try:
-            thread = QuizletDownloader(self, deck_url, quizletDeckID, html)
-            # Connect the signal so that FolderExtract is called in the main thread:
-            thread.folderExtracted.connect(self.FolderExtract)
-            thread.start()
-        except Exception as e:
-            thread = None
+    def onFetched(self, result):
+        # back on the main thread; hand the parsed decks to a CollectionOp so
+        # the inserts are undoable and the UI redraws itself when they land.
+        decks = result["decks"]
 
-        if thread is not None:
-            while not thread.isFinished():
-                mw.app.processEvents()
-                thread.wait(50)
+        if not decks:
+            self.setBusy(False)
+            if result["failures"]:
+                self.label_results.setText(
+                    "Couldn't download any of the {0} deck(s) in that folder".format(
+                        len(result["failures"])))
+            else:
+                self.label_results.setText("Nothing to import")
+            return
+
+        opts = result["opts"]
+
+        CollectionOp(
+            parent=self, op=lambda col: addDecksToCollection(col, decks, opts)
+        ).success(lambda _changes: self.onImported(result)).failure(
+            self.onImportFailed
+        ).run_in_background()
+
+    def onImported(self, result):
+        self.setBusy(False)
+
+        decks = result["decks"]
+        failures = result["failures"]
+        cards = sum(len(deck["items"]) for deck in decks)
+
+        if len(decks) == 1:
+            message = "Success! Imported <b>{0}</b> ({1} cards)".format(
+                deckTitle(decks[0]), cards)
         else:
-            self.label_results.setText("Error: Thread not initialized.")
+            message = "Success! Imported <b>{0}</b> decks ({1} cards)".format(
+                len(decks), cards)
 
-        # error fetching data
-        if thread and thread.error:
-            if thread.errorCode == 403:
-                if thread.errorCaptcha:
+        if failures:
+            message += "<br>Skipped {0} deck(s) that couldn't be downloaded".format(
+                len(failures))
+
+        self.label_results.setText(message)
+
+    def onFetchFailed(self, exception):
+        self.setBusy(False)
+
+        if isinstance(exception, ImportCancelled):
+            self.label_results.setText("Import cancelled")
+            return
+
+        if isinstance(exception, QuizletError):
+            if exception.code == 403:
+                if exception.captcha:
                     self.label_results.setText(
                         "Sorry, it's behind a captcha. Try to disable VPN")
                 else:
                     self.label_results.setText(
                         "Sorry, this is a private deck :(")
-            elif thread.errorCode == 404:
+            elif exception.code == 404:
                 self.label_results.setText(
-                    "Can't find a deck with the ID <i>{0}</i>".format(quizletDeckID))
+                    "Can't find a deck with the ID <i>{0}</i>".format(exception.deck_id))
             else:
                 self.label_results.setText("Unknown Error")
-                showText(thread.errorMessage)
-        else:  # everything went through, let's roll!
-            if quizletDeckID != 'folder':
-                deck = thread.results
-                self.label_results.setText(
-                    ("Importing deck {0}...".format(deck["title"])))
-                self.createDeck(deck)
-                self.label_results.setText(
-                    ("Success! Imported <b>{0}</b> ({1} cards)".format(deck["title"], deck["term_count"])))
+                showText(exception.message or str(exception))
+            return
 
-        if thread and thread.isRunning():
-            thread.quit()
-            thread.wait()
+        self.label_results.setText("Unknown Error")
+        showText("{}".format(exception))
 
-    def createDeck(self, result):
-        # create new deck and custom model
-        if "set" in result:
-            name = result['set']['title']
-        elif "studyable" in result:
-            name = result['studyable']['title']
+    def onImportFailed(self, exception):
+        self.setBusy(False)
+        self.label_results.setText("Unknown Error")
+        showText("{}".format(exception))
+
+
+class ImportCancelled(Exception):
+    """Raised on a worker thread when the user closes the progress dialog."""
+
+
+class QuizletError(Exception):
+    # carries the fields the old code read off the QThread, so the error
+    # messages the user sees are unchanged
+    def __init__(self, deck_id, code=None, captcha=False, message=None):
+        super(QuizletError, self).__init__(message or "Quizlet download failed")
+        self.deck_id = deck_id
+        self.code = code
+        self.captcha = captcha
+        self.message = message
+
+
+class ProgressReporter:
+    """Throttled progress updates, marshalled back onto the main thread.
+
+    mw.progress.update() refuses to run anywhere but the main thread, and a busy
+    import would otherwise post thousands of updates a second.
+    """
+
+    def __init__(self, interval=0.1):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.last = 0.0
+
+    def report(self, label, value=None, maximum=None, force=False):
+        now = time.monotonic()
+
+        with self.lock:
+            if not force and now - self.last < self.interval:
+                return
+            self.last = now
+
+        mw.taskman.run_on_main(
+            lambda: mw.progress.update(label=label, value=value, max=maximum))
+
+
+def checkCancelled():
+    if mw.progress.want_cancel():
+        raise ImportCancelled()
+
+
+def ensureTlsLoaded():
+    """Load the TLS library up front, on one thread.
+
+    tls_requests caches the ctypes handle on a class attribute the first time a
+    client is built; letting a pool of workers race to do that is asking for
+    trouble, so we get it out of the way first.
+    """
+    if tls_get is requests.get:
+        return
+
+    try:
+        from tls_requests.models.tls import TLSClient
+        TLSClient.initialize()
+    except Exception as e:
+        print("quizlet importer: TLS warm-up failed: {}".format(e))
+
+
+def deckTitle(deck):
+    if "set" in deck:
+        return deck['set']['title']
+    if "studyable" in deck:
+        return deck['studyable']['title']
+    return deck['title']
+
+
+def selectItems(items, startPhrase, stopPhrase):
+    """Apply the start/stop phrase window.
+
+    Both the start and the stop item are included, matching the original loop.
+    """
+    selected = []
+    startProcess = False
+    stopProcess = False
+
+    for item in items:
+        if "".__eq__(startPhrase) or startPhrase == item["term"] or startPhrase == item["definition"]:
+            startProcess = True
+
+        if not stopProcess and startProcess:
+            selected.append(item)
+
+        if not "".__eq__(stopPhrase) and (stopPhrase == item["term"] or stopPhrase == item["definition"]):
+            stopProcess = True
+
+    return selected
+
+
+def fetchFolderDeckIDs(folderUrl, opts):
+    downloader = QuizletDownloader(folderUrl, 'folder', '', opts["cookies"])
+    downloader.run()
+
+    if downloader.error:
+        raise QuizletError('folder', downloader.errorCode,
+                           downloader.errorCaptcha, downloader.errorMessage)
+
+    return re.findall(r'"studyMaterialId":"(\d+)"', downloader.folder_html or '')
+
+
+def fetchEverything(deckUrl, quizletDeckID, opts):
+    """Scrape the deck(s) and pull down their media. Runs on a worker thread.
+
+    Returns plain dicts carrying the local media filenames, so the CollectionOp
+    that follows only has to build notes.
+    """
+    progress = ProgressReporter()
+    isFolder = quizletDeckID == 'folder'
+    failures = []
+    decks = []
+
+    if isFolder:
+        progress.report("Reading folder...", force=True)
+        deckIDs = fetchFolderDeckIDs(deckUrl, opts)
+    else:
+        deckIDs = [quizletDeckID]
+
+    for index, deckID in enumerate(deckIDs):
+        checkCancelled()
+
+        if isFolder:
+            progress.report("Downloading deck {0}/{1}...".format(index + 1, len(deckIDs)),
+                            value=index, maximum=len(deckIDs), force=True)
         else:
-            name = result['title']
+            progress.report("Downloading deck...", force=True)
 
-        items = result['items']
-        progress = 0
+        url = "https://quizlet.com/{}/flashcards".format(deckID)
+        downloader = QuizletDownloader(
+            url, deckID, '' if isFolder else opts["html"], opts["cookies"])
+        downloader.run()
 
-        result['term_count'] = len(items)
+        if downloader.error:
+            error = QuizletError(deckID, downloader.errorCode,
+                                 downloader.errorCaptcha, downloader.errorMessage)
+            # one bad deck shouldn't sink a whole folder, but a single deck
+            # import has nothing left to show
+            if not isFolder:
+                raise error
+            failures.append(error)
+            continue
 
-        deck = mw.col.decks.get(mw.col.decks.id(name))
-        model = addCustomModel(mw.col)
+        deck = downloader.results
+        deck["items"] = selectItems(
+            deck["items"], opts["start_phrase"], opts["stop_phrase"])
+        decks.append(deck)
 
-        # assign custom model to new deck
-        mw.col.decks.select(deck["id"])
-        mw.col.decks.save(deck)
+    downloadDeckMedia(decks, opts, progress)
 
-        # assign new deck to custom model
-        mw.col.models.set_current(model)
-        model["did"] = deck["id"]
-        mw.col.models.save(model)
+    return {"decks": decks, "failures": failures, "opts": opts}
 
-        startProcess = False
-        stopProcess = False
-        startPhrase = self.value_start_phrase.text()
-        stopPhrase = self.value_stop_phrase.text()
-        downloadAudio = self.value_download_audio.isChecked()
-        addReverse = self.value_add_reverse.isChecked()
 
-        for item in items:
-            if "".__eq__(startPhrase) or startPhrase == item["term"] or startPhrase == item["definition"]:
-                startProcess = True
+def downloadDeckMedia(decks, opts, progress):
+    """Fetch every note's media in parallel, recording local filenames on the items."""
+    # keyed by (url, suffix) so a file shared by several cards -- typically the
+    # same image -- is fetched once and the name handed to every card that wants
+    # it, instead of two workers writing the same path at the same time
+    jobs = {}
 
-            if not stopProcess and startProcess:
-                note = mw.col.newNote()
-                note["FrontText"] = item["term"]
-                note["BackText"] = item["definition"]
-                note["FrontText"] = ankify(note["FrontText"])
-                note["BackText"] = ankify(note["BackText"])
+    def addJob(item, field, url, suffix):
+        jobs.setdefault((url, suffix), []).append((item, field))
 
-                if item.get('termAudio') and downloadAudio:
-                    file_name = self.fileDownloader(self.getAudioUrl(
-                        item['termAudio']), str(item["id"]) + "-front.mp3", fallback=True)
-                    if file_name:
-                        note["FrontAudio"] = "[sound:" + file_name + "]"
+    for deck in decks:
+        for item in deck["items"]:
+            if opts["download_audio"] and item.get("termAudio"):
+                addJob(item, "frontAudioFile", getAudioUrl(item["termAudio"]),
+                       str(item["id"]) + "-front.mp3")
 
-                if item.get('definitionAudio') and downloadAudio:
-                    file_name = self.fileDownloader(self.getAudioUrl(
-                        item["definitionAudio"]), str(item["id"]) + "-back.mp3", fallback=True)
-                    if file_name:
-                        note["BackAudio"] = "[sound:" + file_name + "]"
+            if opts["download_audio"] and item.get("definitionAudio"):
+                addJob(item, "backAudioFile", getAudioUrl(item["definitionAudio"]),
+                       str(item["id"]) + "-back.mp3")
 
-                if item.get('imageUrl'):
-                    file_name = self.fileDownloader(item["imageUrl"], fallback=True)
-                    if file_name:
-                        note["Image"] += '<div><img src="{0}"></div>'.format(
-                            file_name)
+            if item.get("imageUrl"):
+                addJob(item, "imageFile", item["imageUrl"], '')
 
-                    mw.app.processEvents()
+    if not jobs:
+        return
 
-                if addReverse:
-                    note["Add Reverse"] = "True"
+    ensureTlsLoaded()
 
-                mw.col.addNote(note)
+    def runJob(key):
+        url, suffix = key
+        file_name = fetchMedia(url, opts, suffix=suffix, fallback=True)
 
-                progress += 1
-                self.label_results.setText(
-                    ("Imported {0}/{1}".format(progress, len(items))))
-                mw.app.processEvents()
+        for item, field in jobs[key]:
+            item[field] = file_name
 
-            if not "".__eq__(stopPhrase) and (stopPhrase == item["term"] or stopPhrase == item["definition"]):
-                stopProcess = True
+    total = len(jobs)
+    done = 0
 
-        mw.col.reset()
-        mw.reset()
+    with ThreadPoolExecutor(max_workers=opts["media_workers"]) as pool:
+        futures = [pool.submit(runJob, key) for key in jobs]
 
-    def getAudioUrl(self, word_audio):
-        return word_audio if word_audio.startswith('http') else "https://quizlet.com/{0}".format(word_audio)
+        try:
+            for future in as_completed(futures):
+                future.result()  # surface whatever a worker raised
+                done += 1
+                checkCancelled()
+                progress.report("Downloading media {0}/{1}...".format(done, total),
+                                value=done, maximum=total)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
-    # download the images
-    def fileDownloader(self, url, suffix='', fallback=False):
-        skip_errors = self.value_skip_errors.isChecked()
-        url = url.replace('_m', '')
-        file_name = "quizlet-" + \
-            suffix if suffix else "quizlet-" + url.split('/')[-1]
-        fallback_call = False;
-        request_headers = headers.copy()
 
-        while True:
-            try:
-                return download_media(url, file_name, request_headers)
-            except (urllib2.HTTPError, URLError, TLS_HTTP_ERROR) as e:
-                if fallback and not fallback_call:
-                    fallback_call = True
-                    url = "https://quizlet-proxy.proto.click/quizlet-media?url={0}".format(urllib.parse.quote(url))
-                    request_headers["x-api-key"] = self.config.get("license", public_api_key)
-                    continue
-                if skip_errors:
-                    return None
+def addDecksToCollection(col, decks, opts):
+    """Create the decks and insert every note, as one undoable operation.
+
+    Runs on the collection thread via CollectionOp, which commits the changes and
+    redraws the UI for us -- hence no mw.reset() here.
+    """
+    target = col.add_custom_undo_entry("Import Quizlet deck")
+    model = addCustomModel(col)
+
+    for deck in decks:
+        deckID = DeckId(col.decks.id(deckTitle(deck)))
+        deck["term_count"] = len(deck["items"])
+
+        notes = []
+
+        for item in deck["items"]:
+            note = col.new_note(model)
+            note["FrontText"] = ankify(item["term"] or "")
+            note["BackText"] = ankify(item["definition"] or "")
+
+            if item.get("frontAudioFile"):
+                note["FrontAudio"] = "[sound:" + item["frontAudioFile"] + "]"
+
+            if item.get("backAudioFile"):
+                note["BackAudio"] = "[sound:" + item["backAudioFile"] + "]"
+
+            if item.get("imageFile"):
+                note["Image"] += '<div><img src="{0}"></div>'.format(
+                    item["imageFile"])
+
+            if opts["add_reverse"]:
+                note["Add Reverse"] = "True"
+
+            notes.append(AddNoteRequest(note=note, deck_id=deckID))
+
+        if notes:
+            col.add_notes(notes)
+
+        # leave the imported deck and note type selected, as before
+        col.decks.select(deckID)
+        col.models.set_current(model)
+        model["did"] = deckID
+        col.models.save(model)
+
+    return col.merge_undo_entries(target)
+
+
+def getAudioUrl(word_audio):
+    return word_audio if word_audio.startswith('http') else "https://quizlet.com/{0}".format(word_audio)
+
+
+def fetchMedia(url, opts, suffix='', fallback=False):
+    """Download one media file. Runs on a worker thread, so no Qt in here."""
+    url = url.replace('_m', '')
+    file_name = "quizlet-" + \
+        suffix if suffix else "quizlet-" + url.split('/')[-1]
+    fallback_call = False
+    request_headers = headers.copy()
+
+    while True:
+        try:
+            return download_media(url, file_name, request_headers,
+                                  opts["cookies"], opts["media_dir"])
+        except (urllib2.HTTPError, URLError, TLS_HTTP_ERROR) as e:
+            if fallback and not fallback_call:
+                fallback_call = True
+                url = "https://quizlet-proxy.proto.click/quizlet-media?url={0}".format(
+                    urllib.parse.quote(url))
+                request_headers["x-api-key"] = opts["license"]
+                continue
+            if opts["skip_errors"]:
+                return None
+            else:
+                error_code = getattr(e, 'code', None)
+                if error_code:
+                    print("quizlet importer: throwing exception {}".format(error_code))
                 else:
-                    error_code = getattr(e, 'code', None)
-                    if error_code:
-                        debug(f"throwing exception {error_code}")
-                    else:
-                        debug(f"throwing exception {e}")
-                    raise e
+                    print("quizlet importer: throwing exception {}".format(e))
+                raise e
 
 
-def download_media (url, file_name, headers):
-    cookies = get_cookies()
+def download_media (url, file_name, headers, cookies, media_dir):
     r = tls_get(url, tls_identifier=TLS_IDENTIFIER, headers=headers, cookies=cookies)
     status_code = r.status_code if hasattr(r, "status_code") else r.getcode()
     if status_code == 200:
         body = r.content if hasattr(r, "content") else r.read()
-        with open(mw.col.media.dir() + "/" + file_name, 'wb') as f:
+        with open(os.path.join(media_dir, file_name), 'wb') as f:
             f.write(body)
     return file_name
 
@@ -663,17 +884,17 @@ def mapItems(studiableItems, setIdToDiagramImage=None):
     return result
 
 
-class QuizletDownloader(QThread):
-    # thread that downloads results from the Quizlet API
-    folderExtracted = pyqtSignal(str)
+class QuizletDownloader:
+    # Scrapes a deck (or folder) off Quizlet. Pure network + parsing, so it is
+    # safe to run on a worker thread -- it must never touch Qt or mw.col.
 
-    def __init__(self, window, url, quizletDeckID, html):
-        super(QuizletDownloader, self).__init__()
-        self.window = window
+    def __init__(self, url, quizletDeckID, html, cookies):
         self.url = url
         self.results = None
         self.html = html
         self.quizletDeckID = quizletDeckID
+        self.cookies = cookies
+        self.folder_html = None
 
         self.error = False
         self.errorCode = None
@@ -682,6 +903,8 @@ class QuizletDownloader(QThread):
         self.errorMessage = None
 
     def getDataFromApi(self):
+        itemsResponse = None
+
         try:
             deckUrl = 'https://quizlet.com/webapi/3.9/sets/{0}'.format(
                 self.quizletDeckID)
@@ -706,7 +929,7 @@ class QuizletDownloader(QThread):
         except Exception as e:
             self.error = True
             self.errorMessage = "{}\n-----------------\n{}".format(
-                e, itemsResponse.text)
+                e, itemsResponse.text if itemsResponse is not None else "")
 
     def getDataFromPage(self):
         proxyRetry = True
@@ -714,7 +937,7 @@ class QuizletDownloader(QThread):
         while True:
             try:
                 r = None
-                cookies = get_cookies()
+                cookies = self.cookies
 
                 page_html = ''
 
@@ -724,7 +947,7 @@ class QuizletDownloader(QThread):
                     r = tls_get(url, tls_identifier=TLS_IDENTIFIER, headers=headers, cookies=cookies)
                     r.raise_for_status()
                     page_html = r.text
-                    self.folderExtracted.emit(page_html)
+                    self.folder_html = page_html
                 else:
                     if self.html:
                         page_html = self.html
@@ -842,7 +1065,8 @@ class QuizletDownloader(QThread):
     def run(self):
         self.getDataFromPage()
 
-        if (self.error):
+        # the webapi fallback only knows about sets, not folders
+        if self.error and self.quizletDeckID != 'folder':
             self.getDataFromApi()
 
 # plugin was called from Anki

@@ -73,6 +73,18 @@ The skip errors checkbox allows to skip media download errors.
 * BackAudio - `[sound:"quizlet-CARD_ID-back.mp3"]`
 * Image - `<img src="file_name">`
 
+### Configuration
+
+Set these in Anki via *Tools → Add-ons → Improved Quizlet to Anki 21 Importer → Config*:
+
+* `qlts` / `cookies` - your Quizlet session, for private or login-only decks
+* `media_workers` - how many audio/image files to download at once (default `6`).
+  Lower it if Quizlet starts rejecting requests; raise it on a fast connection.
+
+Imports run in the background, so Anki stays usable while a deck downloads. Press
+`Esc` (or close the progress window) to cancel one. The whole import lands as a
+single entry in *Edit → Undo*.
+
 ## Repo Activity
 
 ![Repo Activity](https://repobeats.axiom.co/api/embed/94e61d46859061470cdf238cbad04e80bcc57300.svg "Repobeats analytics image")
