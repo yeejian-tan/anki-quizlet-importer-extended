@@ -17,13 +17,23 @@ Instead of creating Front and Back items this version creates these fields
 
 Note type name is `Basic Quizlet Extended`;
 
-Supports start and stop phrases. It allows you to download a part of the quizlet collection.
+### Importing
 
-![image](https://github.com/sviatoslav-lebediev/anki-quizlet-importer-extended/assets/19693768/2b08ec5b-44db-4a71-9c45-488ced6f535c)
+Paste a deck or folder URL and press **Add**. Decks are queued and imported one
+at a time in the background, so Anki stays usable and you can keep adding URLs
+while they download. Each row shows its own progress and can be cancelled; a
+finished import lands as a single entry in *Edit → Undo*.
 
 The skip errors checkbox allows to skip media download errors. A file that
 can't be downloaded is left out of the note, so cards never reference media
 that isn't in your collection.
+
+Under **Advanced**:
+
+* **Start / stop phrase** — import only the part of a deck between two terms.
+  Both the start and the stop term are included.
+* **Page HTML** — a fallback for when Quizlet blocks the download. Open the deck
+  page, view its source, and paste it here. Doesn't apply to folders.
 
 ### This addon creates two types of cards: Normal and Reverse
 

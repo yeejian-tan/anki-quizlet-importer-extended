@@ -36,7 +36,7 @@ import webbrowser
 import ssl
 from aqt.utils import showText
 from aqt.qt import *
-from aqt import mw
+from aqt import gui_hooks, mw
 import os
 import sys
 import logging
@@ -181,239 +181,360 @@ def ankify(text):
     text = text.replace('class="bgP"', 'style="background-color:#fde8ff;"')
     return text
 
+def parseQuizletUrl(url):
+    """Work out what a pasted URL points at.
+
+    Returns (deck id, None) on success, or (None, message) to show the user.
+    'folder' is returned in place of an id for folder URLs.
+    """
+    url = url.strip()
+
+    if not url:
+        return None, "Enter a Quizlet deck URL"
+
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme:
+        parsed = urllib.parse.urlparse("https://" + url)
+
+    if "quizlet.com" not in parsed.netloc:
+        return None, "That's not a Quizlet URL"
+
+    path = parsed.path.strip("/")
+
+    if not path:
+        return None, "Please use the full deck URL"
+
+    if re.search(r'user/', path) and re.search(r'/folders', path):
+        if not re.match(r'user/[^/]+/folders/[^/]*', path):
+            return None, "That folder URL doesn't look right"
+        return 'folder', None
+
+    if not bool(re.search(r'\d', path)):
+        return None, "No deck ID found in <i>{0}</i>".format(path)
+
+    return re.search(r"\d+", path).group(0), None
+
+
+def describeError(exception):
+    """One short line for a queue row."""
+    if isinstance(exception, QuizletError):
+        if exception.code == 403:
+            if exception.captcha:
+                return "Behind a captcha — try disabling your VPN"
+            return "This deck is private"
+        if exception.code == 404:
+            return "No deck with the ID {0}".format(exception.deck_id)
+        return "Download failed"
+    return str(exception) or exception.__class__.__name__
+
+
+def errorDetails(exception):
+    """The full text behind a failed row's details button, if there is any."""
+    if isinstance(exception, QuizletError):
+        return exception.message
+    return "{}: {}".format(exception.__class__.__name__, exception)
+
+
+class QueueEntry:
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    def __init__(self, url, deckID, opts):
+        self.url = url
+        self.deckID = deckID
+        self.opts = opts
+        self.status = self.QUEUED
+        self.title = self.describeUrl()
+        self.detail = "Waiting"
+        self.value = None
+        self.maximum = None
+        self.cards = 0
+        self.details = None
+        self.cancel = threading.Event()
+
+    def describeUrl(self):
+        parsed = urllib.parse.urlparse(self.url)
+        if not parsed.scheme:
+            parsed = urllib.parse.urlparse("https://" + self.url)
+        return parsed.path.strip("/") or self.url
+
+    @property
+    def finished(self):
+        return self.status in (self.DONE, self.FAILED, self.CANCELLED)
+
+
+class QueueRow(QWidget):
+    """One line of the queue: status glyph, name, progress, and an action button."""
+
+    GLYPHS = {
+        QueueEntry.QUEUED: "·",
+        QueueEntry.RUNNING: "▸",
+        QueueEntry.DONE: "✓",
+        QueueEntry.FAILED: "✗",
+        QueueEntry.CANCELLED: "✗",
+    }
+
+    def __init__(self, entry, onCancel, onDetails):
+        super(QueueRow, self).__init__()
+        self.entry = entry
+        self.onCancel = onCancel
+        self.onDetails = onDetails
+
+        self.glyph = QLabel()
+        self.glyph.setFixedWidth(14)
+        self.glyph.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self.title = QLabel()
+        self.title.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                 QSizePolicy.Policy.Preferred)
+
+        self.detail = QLabel()
+        self.detail.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                  QSizePolicy.Policy.Preferred)
+        smaller = self.detail.font()
+        smaller.setPointSizeF(max(7.0, smaller.pointSizeF() - 1.0))
+        self.detail.setFont(smaller)
+
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(3)
+        self.bar.hide()
+
+        self.button = QToolButton()
+        self.button.setAutoRaise(True)
+        self.button.clicked.connect(self.onButton)
+
+        text = QVBoxLayout()
+        text.setContentsMargins(0, 0, 0, 0)
+        text.setSpacing(3)
+        text.addWidget(self.title)
+        text.addWidget(self.bar)
+        text.addWidget(self.detail)
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(4, 5, 4, 5)
+        layout.setSpacing(6)
+        layout.addWidget(self.glyph)
+        layout.addLayout(text, 1)
+        layout.addWidget(self.button, 0, Qt.AlignmentFlag.AlignTop)
+        self.setLayout(layout)
+
+        self.refresh()
+
+    def onButton(self):
+        if self.entry.finished:
+            self.onDetails(self.entry)
+        else:
+            self.onCancel(self.entry)
+
+    def refresh(self):
+        entry = self.entry
+
+        self.glyph.setText(self.GLYPHS.get(entry.status, "·"))
+        self.title.setText(entry.title)
+        self.detail.setText(entry.detail)
+
+        if entry.finished:
+            self.button.setText("…")
+            self.button.setToolTip("Show details")
+            self.button.setVisible(bool(entry.details))
+        else:
+            self.button.setText("✕")
+            self.button.setToolTip("Cancel")
+            self.button.setVisible(True)
+
+        if entry.status == QueueEntry.RUNNING:
+            # maximum of 0 makes Qt draw a busy indicator
+            self.bar.setMaximum(entry.maximum or 0)
+            self.bar.setValue(entry.value or 0)
+            self.bar.show()
+        else:
+            self.bar.hide()
+
+
 class QuizletWindow(QWidget):
     # main window of Quizlet plugin
+
     def __init__(self):
         super(QuizletWindow, self).__init__()
 
         self.config = mw.addonManager.getConfig(__name__)
+        self.queue = []
+        self.rows = {}
+        self.current = None
 
         self.initGUI()
 
-    # create GUI skeleton
+    # ---------------------------------------------------------------- layout
+
     def initGUI(self):
-
-        self.box_top = QVBoxLayout()
-        self.box_upper = QHBoxLayout()
-
-        # left side
-        self.box_left = QVBoxLayout()
-        self.check_boxes = QHBoxLayout()
-
-        self.box_incoming_html = QHBoxLayout()
-        self.box_incoming_html_left = QVBoxLayout()
-        self.box_incoming_html_right = QHBoxLayout()
-
-        self.value_incoming_html = QTextEdit("", self)
-        self.value_incoming_html.setMinimumWidth(300)
-        self.value_incoming_html.setPlaceholderText(
-            """Enter page html if you constantly receive errors
-
-1. Enter the url in 'Quizlet URL:'
-2. Click 'Open html' (opens webpage)
-3. Right-click, then click 'View page source'
-4. Copy the all HTML and paste into 'Page html:'
-5. Click 'Import Deck'
-
-Note: 'Page html' does not support Quizlet folder import
-""")
-
-        self.label_incoming_html = QLabel("Page html:")
-        self.label_incoming_html.setMinimumWidth(98)
-        self.button_html = QPushButton("Open html", self)
-        self.button_html.clicked.connect(self.onHmtl)
-
-        self.box_incoming_html_left.addWidget(self.label_incoming_html)
-        self.box_incoming_html_left.addWidget(self.button_html)
-        self.box_incoming_html_left.addStretch()
-
-        self.box_incoming_html_right.addWidget(self.value_incoming_html)
-        self.box_incoming_html.addLayout(self.box_incoming_html_left)
-        self.box_incoming_html.addLayout(self.box_incoming_html_right)
-
-        # quizlet url field
-        self.box_name = QHBoxLayout()
-        self.label_url = QLabel("Quizlet URL:")
+        box_url = QHBoxLayout()
+        box_url.setSpacing(6)
         self.text_url = QLineEdit("", self)
-        self.text_url.setMinimumWidth(300)
+        self.text_url.setPlaceholderText(
+            "https://quizlet.com/150875612/usmle-flash-cards/")
         self.text_url.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.text_url.setFocus()
+        self.text_url.returnPressed.connect(self.onAdd)
+        self.button_add = QPushButton("Add", self)
+        self.button_add.clicked.connect(self.onAdd)
+        box_url.addWidget(QLabel("Quizlet URL"))
+        box_url.addWidget(self.text_url, 1)
+        box_url.addWidget(self.button_add)
 
-        self.label_url.setMinimumWidth(100)
-        self.box_name.addWidget(self.label_url)
-        self.box_name.addWidget(self.text_url)
+        self.label_message = QLabel("")
+        self.label_message.setWordWrap(True)
+        self.label_message.hide()
 
-        self.box_download_audio = QHBoxLayout()
-        self.value_download_audio = QCheckBox("", self)
-        self.label_download_audio = QLabel("Download audio:")
-        self.value_download_audio.toggle()
-        self.label_download_audio.setMinimumWidth(100)
-        self.box_download_audio.addWidget(self.label_download_audio)
-        self.box_download_audio.addWidget(self.value_download_audio)
+        self.list_queue = QListWidget(self)
+        self.list_queue.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection)
+        self.list_queue.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list_queue.setMinimumHeight(170)
+        self.list_queue.hide()
 
-        self.box_add_reverse = QHBoxLayout()
-        self.value_add_reverse = QCheckBox("", self)
-        self.label_add_reverse = QLabel("Add reverse:")
-        self.box_add_reverse.addWidget(self.label_add_reverse)
-        self.box_add_reverse.addWidget(self.value_add_reverse)
+        self.label_empty = QLabel(
+            "Add a deck or folder URL to start.\nImports run in the background — you can keep using Anki.")
+        self.label_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label_empty.setMinimumHeight(170)
 
-        self.box_skip_errors = QHBoxLayout()
-        self.value_skip_errors = QCheckBox("", self)
-        self.value_skip_errors.toggle()
+        box_options = QHBoxLayout()
+        box_options.setSpacing(14)
+        self.value_download_audio = QCheckBox("Download audio", self)
+        self.value_download_audio.setChecked(True)
+        self.value_add_reverse = QCheckBox("Add reverse", self)
+        self.value_skip_errors = QCheckBox("Skip errors", self)
+        self.value_skip_errors.setChecked(True)
         self.value_skip_errors.setToolTip(
-            'Will skip audio/images download errors (recommend: Enabled)')
-        self.label_skip_errors = QLabel("Skip errors:")
-        self.label_skip_errors.setToolTip(
-            'Will skip audio/images download errors (recommend: Enabled)')
-        self.box_skip_errors.addWidget(self.label_skip_errors)
-        self.box_skip_errors.addWidget(self.value_skip_errors)
+            "Leave out audio and images that fail to download, instead of stopping the import")
+        box_options.addWidget(self.value_download_audio)
+        box_options.addWidget(self.value_add_reverse)
+        box_options.addWidget(self.value_skip_errors)
+        box_options.addStretch()
 
-        self.box_start_phrase = QHBoxLayout()
-        self.value_start_phrase = QLineEdit("", self)
-        self.value_start_phrase.setMinimumWidth(300)
-        self.value_start_phrase.setPlaceholderText(
-            'Start from this phrase. Can be empty')
-        self.label_start_phrase = QLabel("Start Phrase:")
-        self.label_start_phrase.setMinimumWidth(100)
-        self.box_start_phrase.addWidget(self.label_start_phrase)
-        self.box_start_phrase.addWidget(self.value_start_phrase)
+        self.advanced_shown = False
+        self.button_advanced = QPushButton("▸  Advanced", self)
+        self.button_advanced.setFlat(True)
+        self.button_advanced.setSizePolicy(QSizePolicy.Policy.Maximum,
+                                           QSizePolicy.Policy.Fixed)
+        self.button_advanced.clicked.connect(self.onToggleAdvanced)
 
-        self.box_stop_phrase = QHBoxLayout()
-        self.value_stop_phrase = QLineEdit("", self)
-        self.value_stop_phrase.setMinimumWidth(300)
-        self.value_stop_phrase.setPlaceholderText(
-            'Stop after this phrase. Can be empty')
-        self.label_stop_phrase = QLabel("Stop Phrase:")
-        self.label_stop_phrase.setMinimumWidth(100)
-        self.box_stop_phrase.addWidget(self.label_stop_phrase)
-        self.box_stop_phrase.addWidget(self.value_stop_phrase)
+        box_advanced = QHBoxLayout()
+        box_advanced.addWidget(self.button_advanced)
+        box_advanced.addStretch()
 
-        # add layouts to left
-        self.box_left.addLayout(self.box_name)
-        self.box_left.addLayout(self.check_boxes)
-        self.check_boxes.addLayout(self.box_download_audio)
-        self.check_boxes.addLayout(self.box_add_reverse)
-        self.check_boxes.addLayout(self.box_skip_errors)
-        self.check_boxes.addStretch()
+        self.widget_advanced = self.buildAdvanced()
+        self.widget_advanced.hide()
 
-        self.box_left.addLayout(self.box_start_phrase)
-        self.box_left.addLayout(self.box_stop_phrase)
-        self.box_left.addLayout(self.box_incoming_html)
-
-        # right side
-        self.box_right = QVBoxLayout()
-
-        # code (import set) button
-        self.box_code = QVBoxLayout()
-        self.button_code = QPushButton("Import Deck", self)
-        # self.box_code.addStretch(1)
-        self.box_code.addWidget(self.button_code)
-        self.button_code.clicked.connect(self.onCode)
-
-        # add layouts to right
-        self.box_right.addLayout(self.box_code)
-        self.box_right.addStretch()
-
-        # add left and right layouts to upper
-        self.box_upper.addLayout(self.box_left)
-        self.box_upper.addSpacing(20)
-        self.box_upper.addLayout(self.box_right)
-
-        # results label and FAQ button
-        self.label_results = QLabel(
-            "\r\n<i>Example: https://quizlet.com/150875612/usmle-flash-cards/</i>")
+        box_bottom = QHBoxLayout()
+        self.button_clear = QPushButton("Clear finished", self)
+        self.button_clear.clicked.connect(self.onClearFinished)
+        self.button_clear.setEnabled(False)
         self.button_faq = QPushButton("FAQ", self)
         self.button_faq.clicked.connect(self.onFaq)
+        box_bottom.addWidget(self.button_clear)
+        box_bottom.addStretch()
+        box_bottom.addWidget(self.button_faq)
 
-        self.box_results = QHBoxLayout()
-        self.box_results.addWidget(self.label_results)
-        self.box_results.addStretch()
-        self.box_results.addWidget(self.button_faq)
+        box_top = QVBoxLayout()
+        box_top.setSpacing(10)
+        box_top.addLayout(box_url)
+        box_top.addWidget(self.label_message)
+        box_top.addWidget(self.label_empty)
+        box_top.addWidget(self.list_queue, 1)
+        box_top.addLayout(box_options)
+        box_top.addLayout(box_advanced)
+        box_top.addWidget(self.widget_advanced)
+        box_top.addLayout(box_bottom)
+        self.setLayout(box_top)
 
-        # add all widgets to top layout
-        self.box_top.addLayout(self.box_upper)
-        self.box_top.addLayout(self.box_results)
-        self.box_top.addStretch(1)
-        self.setLayout(self.box_top)
-
-        # go, baby go!
-        self.setMinimumWidth(600)
-        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
-        self.setWindowTitle("Improved Quizlet to Anki Importer")
+        self.setMinimumWidth(520)
+        self.setWindowTitle("Import from Quizlet")
+        self.text_url.setFocus()
         self.show()
 
-    def onHmtl(self):
-        """
-        Opens the flascards html page in a browser
-        """
-        quizletDeckID = self.getQuizletDeckID()
+    def buildAdvanced(self):
+        """Start/stop phrases and the page-HTML escape hatch, out of the way."""
+        self.value_start_phrase = QLineEdit("", self)
+        self.value_start_phrase.setPlaceholderText(
+            "Start importing from this term. Can be empty")
+        self.value_stop_phrase = QLineEdit("", self)
+        self.value_stop_phrase.setPlaceholderText(
+            "Stop after this term. Can be empty")
 
-        if quizletDeckID == None:
+        self.value_incoming_html = QTextEdit("", self)
+        self.value_incoming_html.setMaximumHeight(90)
+        self.value_incoming_html.setPlaceholderText(
+            "If an import keeps failing, open the deck page, view its source, and paste it here. "
+            "Does not apply to folders.")
+
+        self.button_html = QPushButton("Open deck page", self)
+        self.button_html.clicked.connect(self.onHtml)
+
+        box_start = QHBoxLayout()
+        box_start.addWidget(QLabel("Start phrase"))
+        box_start.addWidget(self.value_start_phrase, 1)
+
+        box_stop = QHBoxLayout()
+        box_stop.addWidget(QLabel("Stop phrase"))
+        box_stop.addWidget(self.value_stop_phrase, 1)
+
+        box_html_label = QHBoxLayout()
+        box_html_label.addWidget(QLabel("Page HTML"))
+        box_html_label.addStretch()
+        box_html_label.addWidget(self.button_html)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addLayout(box_start)
+        layout.addLayout(box_stop)
+        layout.addLayout(box_html_label)
+        layout.addWidget(self.value_incoming_html)
+
+        widget = QWidget(self)
+        widget.setLayout(layout)
+        return widget
+
+    def onToggleAdvanced(self):
+        self.advanced_shown = not self.advanced_shown
+        self.button_advanced.setText(
+            "▾  Advanced" if self.advanced_shown else "▸  Advanced")
+        self.widget_advanced.setVisible(self.advanced_shown)
+        self.adjustSize()
+
+    def onHtml(self):
+        deckID, error = parseQuizletUrl(self.text_url.text())
+
+        if error:
+            self.showMessage(error)
             return
 
-        webbrowser.open(
-            "https://quizlet.com/{}/flashcards".format(quizletDeckID))
+        if deckID == 'folder':
+            self.showMessage("Page HTML doesn't work for folders")
+            return
+
+        webbrowser.open("https://quizlet.com/{}/flashcards".format(deckID))
 
     def onFaq(self):
         webbrowser.open(
             "https://github.com/sviatoslav-lebediev/anki-quizlet-importer-extended/wiki/FAQ")
 
-    def getQuizletDeckID(self):
-        # grab url input
-        url = self.text_url.text()
+    def showMessage(self, text):
+        self.label_message.setText(text or "")
+        self.label_message.setVisible(bool(text))
 
-        # voodoo needed for some error handling
-        if urllib.parse.urlparse(url).scheme:
-            urlDomain = urllib.parse.urlparse(url).netloc
-        else:
-            urlDomain = urllib.parse.urlparse("https://"+url).netloc
-
-        # validate quizlet URL
-        if url == "":
-            self.label_results.setText("Oops! You forgot the deck URL :(")
-            return
-        elif not "quizlet.com" in urlDomain:
-            self.label_results.setText("Oops! That's not a Quizlet URL :(")
-            return
-
-
-        # voodoo needed for some error handling
-        if urllib.parse.urlparse(url).scheme:
-            urlPath = urllib.parse.urlparse(url).path
-        else:
-            urlPath = urllib.parse.urlparse("https://"+url).path
-        # validate and set Quizlet deck ID
-        quizletDeckID = urlPath.strip("/")
-
-
-
-        if quizletDeckID == "":
-            self.label_results.setText("Oops! Please use the full deck URL :(")
-            return
-        elif re.search(r'user/', quizletDeckID) and re.search(r'/folders', quizletDeckID):
-            match_full = re.match(r'user/[^/]+/folders/[^/]*', quizletDeckID)
-            if not match_full:
-                self.label_results.setText("Oops! Invalid Folder URL")
-                return
-            else:
-                self.label_results.setText("Going to import a folder !")
-                quizletDeckID = 'folder'
-                return quizletDeckID
-        elif not bool(re.search(r'\d', quizletDeckID)):
-            self.label_results.setText(
-                "Oops! No deck ID found in path <i>{0}</i> :(".format(quizletDeckID))
-            return
-        else:  # get first set of digits from url path
-            quizletDeckID = re.search(r"\d+", quizletDeckID).group(0)
-
-
-        return quizletDeckID
+    # ----------------------------------------------------------------- queue
 
     def snapshotOptions(self):
         """Read everything the import needs off the widgets and the collection.
 
         The background threads must not touch Qt or mw.col, so every value they
-        rely on is captured here, on the main thread, before the op starts.
+        rely on is captured here, on the main thread, when the entry is queued.
+        That also means later edits to these fields don't change what is already
+        waiting in the queue.
         """
         return {
             "html": self.value_incoming_html.toPlainText(),
@@ -428,104 +549,185 @@ Note: 'Page html' does not support Quizlet folder import
             "media_workers": max(1, int(self.config.get("media_workers", DEFAULT_MEDIA_WORKERS))),
         }
 
-    def setBusy(self, busy):
-        self.button_code.setEnabled(not busy)
+    def onAdd(self):
+        url = self.text_url.text().strip()
+        deckID, error = parseQuizletUrl(url)
 
-    def onCode(self, _checked=False):
-        """Import button handler. Starts the download and returns immediately."""
-        quizletDeckID = self.getQuizletDeckID()
-
-        if quizletDeckID is None:
+        if error:
+            self.showMessage(error)
             return
 
-        if quizletDeckID == 'folder':
-            deck_url = self.text_url.text()
-        else:
-            deck_url = "https://quizlet.com/{}/flashcards".format(quizletDeckID)
+        if any(entry.url == url and not entry.finished for entry in self.queue):
+            self.showMessage("That URL is already in the queue")
+            return
 
-        opts = self.snapshotOptions()
-        self.setBusy(True)
-        self.label_results.setText("Connecting to Quizlet...")
+        self.showMessage(None)
 
+        entry = QueueEntry(url, deckID, self.snapshotOptions())
+        self.queue.append(entry)
+        self.addRow(entry)
+        self.text_url.clear()
+        self.refreshChrome()
+        self.pump()
+
+    def pump(self):
+        """Start the next queued entry, one at a time."""
+        if self.current is not None:
+            return
+
+        for entry in self.queue:
+            if entry.status == QueueEntry.QUEUED:
+                self.startEntry(entry)
+                return
+
+    def startEntry(self, entry):
+        self.current = entry
+        entry.status = QueueEntry.RUNNING
+        entry.detail = "Connecting…"
+        self.refreshRow(entry)
+
+        progress = ProgressReporter(
+            lambda label, value, maximum: self.onProgress(entry, label, value, maximum))
+
+        # no .with_progress() here on purpose: a modal dialog would stop the
+        # user adding more URLs while this one downloads
         QueryOp(
             parent=self,
-            op=lambda col: fetchEverything(deck_url, quizletDeckID, opts),
-            success=self.onFetched,
-        ).failure(self.onFetchFailed).with_progress("Connecting to Quizlet...").run_in_background()
+            op=lambda col: fetchEverything(
+                entry.url, entry.deckID, entry.opts, progress, entry.cancel),
+            success=lambda result: self.onFetched(entry, result),
+        ).failure(lambda e: self.onFailed(entry, e)).without_collection().run_in_background()
 
-    def onFetched(self, result):
-        # back on the main thread; hand the parsed decks to a CollectionOp so
-        # the inserts are undoable and the UI redraws itself when they land.
+    def onProgress(self, entry, label, value, maximum):
+        if entry.status != QueueEntry.RUNNING:
+            return
+
+        entry.detail = label
+        entry.value = value
+        entry.maximum = maximum
+        self.refreshRow(entry)
+
+    def onFetched(self, entry, result):
+        if entry.cancel.is_set():
+            self.finishEntry(entry, QueueEntry.CANCELLED, "Cancelled")
+            return
+
         decks = result["decks"]
 
         if not decks:
-            self.setBusy(False)
             if result["failures"]:
-                self.label_results.setText(
-                    "Couldn't download any of the {0} deck(s) in that folder".format(
-                        len(result["failures"])))
+                self.finishEntry(entry, QueueEntry.FAILED,
+                                 "None of the {0} decks could be downloaded".format(
+                                     len(result["failures"])))
             else:
-                self.label_results.setText("Nothing to import")
+                self.finishEntry(entry, QueueEntry.FAILED, "Nothing to import")
             return
 
-        opts = result["opts"]
+        entry.title = deckTitle(decks[0]) if len(
+            decks) == 1 else "{0} decks".format(len(decks))
+        entry.cards = sum(len(deck["items"]) for deck in decks)
+        entry.detail = "Adding {0} cards…".format(entry.cards)
+        entry.value = entry.maximum = None
+        self.refreshRow(entry)
 
         CollectionOp(
-            parent=self, op=lambda col: addDecksToCollection(col, decks, opts)
-        ).success(lambda _changes: self.onImported(result)).failure(
-            self.onImportFailed
+            parent=self,
+            op=lambda col: addDecksToCollection(col, decks, entry.opts),
+        ).success(lambda _changes: self.onAdded(entry, result)).failure(
+            lambda e: self.onFailed(entry, e)
         ).run_in_background()
 
-    def onImported(self, result):
-        self.setBusy(False)
+    def onAdded(self, entry, result):
+        detail = "{0} cards".format(entry.cards)
 
-        decks = result["decks"]
-        failures = result["failures"]
-        cards = sum(len(deck["items"]) for deck in decks)
+        if result["failures"]:
+            detail += " · {0} deck(s) skipped".format(
+                len(result["failures"]))
+            entry.details = "\n\n".join(
+                "{0}: {1}".format(f.deck_id, describeError(f)) for f in result["failures"])
 
-        if len(decks) == 1:
-            message = "Success! Imported <b>{0}</b> ({1} cards)".format(
-                deckTitle(decks[0]), cards)
-        else:
-            message = "Success! Imported <b>{0}</b> decks ({1} cards)".format(
-                len(decks), cards)
+        self.finishEntry(entry, QueueEntry.DONE, detail)
 
-        if failures:
-            message += "<br>Skipped {0} deck(s) that couldn't be downloaded".format(
-                len(failures))
-
-        self.label_results.setText(message)
-
-    def onFetchFailed(self, exception):
-        self.setBusy(False)
-
+    def onFailed(self, entry, exception):
         if isinstance(exception, ImportCancelled):
-            self.label_results.setText("Import cancelled")
+            self.finishEntry(entry, QueueEntry.CANCELLED, "Cancelled")
             return
 
-        if isinstance(exception, QuizletError):
-            if exception.code == 403:
-                if exception.captcha:
-                    self.label_results.setText(
-                        "Sorry, it's behind a captcha. Try to disable VPN")
-                else:
-                    self.label_results.setText(
-                        "Sorry, this is a private deck :(")
-            elif exception.code == 404:
-                self.label_results.setText(
-                    "Can't find a deck with the ID <i>{0}</i>".format(exception.deck_id))
-            else:
-                self.label_results.setText("Unknown Error")
-                showText(exception.message or str(exception))
-            return
+        entry.details = errorDetails(exception)
+        self.finishEntry(entry, QueueEntry.FAILED, describeError(exception))
 
-        self.label_results.setText("Unknown Error")
-        showText("{}".format(exception))
+    def finishEntry(self, entry, status, detail):
+        entry.status = status
+        entry.detail = detail
+        entry.value = entry.maximum = None
+        self.refreshRow(entry)
 
-    def onImportFailed(self, exception):
-        self.setBusy(False)
-        self.label_results.setText("Unknown Error")
-        showText("{}".format(exception))
+        if self.current is entry:
+            self.current = None
+
+        self.refreshChrome()
+        self.pump()
+
+    def onCancel(self, entry):
+        entry.cancel.set()
+
+        if entry.status == QueueEntry.QUEUED:
+            self.finishEntry(entry, QueueEntry.CANCELLED, "Cancelled")
+        else:
+            entry.detail = "Cancelling…"
+            self.refreshRow(entry)
+
+    def onDetails(self, entry):
+        if entry.details:
+            showText(entry.details)
+
+    def onClearFinished(self):
+        for entry in [e for e in self.queue if e.finished]:
+            self.removeRow(entry)
+            self.queue.remove(entry)
+
+        self.refreshChrome()
+
+    # ------------------------------------------------------------------ rows
+
+    def addRow(self, entry):
+        row = QueueRow(entry, self.onCancel, self.onDetails)
+        item = QListWidgetItem()
+        item.setSizeHint(row.sizeHint())
+        self.list_queue.addItem(item)
+        self.list_queue.setItemWidget(item, row)
+        self.rows[id(entry)] = (item, row)
+        self.list_queue.scrollToItem(item)
+
+    def refreshRow(self, entry):
+        pair = self.rows.get(id(entry))
+
+        if pair:
+            item, row = pair
+            row.refresh()
+            item.setSizeHint(row.sizeHint())
+
+    def removeRow(self, entry):
+        pair = self.rows.pop(id(entry), None)
+
+        if pair:
+            item, _row = pair
+            self.list_queue.takeItem(self.list_queue.row(item))
+
+    def refreshChrome(self):
+        has_rows = bool(self.queue)
+        self.list_queue.setVisible(has_rows)
+        self.label_empty.setVisible(not has_rows)
+        self.button_clear.setEnabled(
+            any(entry.finished for entry in self.queue))
+
+    def shutdown(self):
+        """Stop everything; called when the profile closes out from under us."""
+        for entry in self.queue:
+            entry.cancel.set()
+
+        self.current = None
+        self.close()
 
 
 class ImportCancelled(Exception):
@@ -546,11 +748,12 @@ class QuizletError(Exception):
 class ProgressReporter:
     """Throttled progress updates, marshalled back onto the main thread.
 
-    mw.progress.update() refuses to run anywhere but the main thread, and a busy
-    import would otherwise post thousands of updates a second.
+    Qt may only be touched from the main thread, and a busy import would
+    otherwise post thousands of updates a second at the queue row.
     """
 
-    def __init__(self, interval=0.1):
+    def __init__(self, sink, interval=0.1):
+        self.sink = sink
         self.interval = interval
         self.lock = threading.Lock()
         self.last = 0.0
@@ -563,12 +766,12 @@ class ProgressReporter:
                 return
             self.last = now
 
-        mw.taskman.run_on_main(
-            lambda: mw.progress.update(label=label, value=value, max=maximum))
+        sink = self.sink
+        mw.taskman.run_on_main(lambda: sink(label, value, maximum))
 
 
-def checkCancelled():
-    if mw.progress.want_cancel():
+def checkCancelled(cancel):
+    if cancel.is_set():
         raise ImportCancelled()
 
 
@@ -630,31 +833,30 @@ def fetchFolderDeckIDs(folderUrl, opts):
     return re.findall(r'"studyMaterialId":"(\d+)"', downloader.folder_html or '')
 
 
-def fetchEverything(deckUrl, quizletDeckID, opts):
+def fetchEverything(deckUrl, quizletDeckID, opts, progress, cancel):
     """Scrape the deck(s) and pull down their media. Runs on a worker thread.
 
     Returns plain dicts carrying the local media filenames, so the CollectionOp
     that follows only has to build notes.
     """
-    progress = ProgressReporter()
     isFolder = quizletDeckID == 'folder'
     failures = []
     decks = []
 
     if isFolder:
-        progress.report("Reading folder...", force=True)
+        progress.report("Reading folder\u2026", force=True)
         deckIDs = fetchFolderDeckIDs(deckUrl, opts)
     else:
         deckIDs = [quizletDeckID]
 
     for index, deckID in enumerate(deckIDs):
-        checkCancelled()
+        checkCancelled(cancel)
 
         if isFolder:
-            progress.report("Downloading deck {0}/{1}...".format(index + 1, len(deckIDs)),
+            progress.report("Deck {0} of {1}\u2026".format(index + 1, len(deckIDs)),
                             value=index, maximum=len(deckIDs), force=True)
         else:
-            progress.report("Downloading deck...", force=True)
+            progress.report("Downloading deck\u2026", force=True)
 
         url = "https://quizlet.com/{}/flashcards".format(deckID)
         downloader = QuizletDownloader(
@@ -676,12 +878,12 @@ def fetchEverything(deckUrl, quizletDeckID, opts):
             deck["items"], opts["start_phrase"], opts["stop_phrase"])
         decks.append(deck)
 
-    downloadDeckMedia(decks, opts, progress)
+    downloadDeckMedia(decks, opts, progress, cancel)
 
     return {"decks": decks, "failures": failures, "opts": opts}
 
 
-def downloadDeckMedia(decks, opts, progress):
+def downloadDeckMedia(decks, opts, progress, cancel):
     """Fetch every note's media in parallel, recording local filenames on the items."""
     # keyed by (url, suffix) so a file shared by several cards -- typically the
     # same image -- is fetched once and the name handed to every card that wants
@@ -726,9 +928,9 @@ def downloadDeckMedia(decks, opts, progress):
             for future in as_completed(futures):
                 future.result()  # surface whatever a worker raised
                 done += 1
-                checkCancelled()
-                progress.report("Downloading media {0}/{1}...".format(done, total),
-                                value=done, maximum=total)
+                checkCancelled(cancel)
+                progress.report("Media {0} of {1}".format(done, total),
+                                value=done, maximum=total, force=done == total)
         except BaseException:
             for future in futures:
                 future.cancel()
@@ -1087,7 +1289,27 @@ class QuizletDownloader:
 
 def runQuizletPlugin():
     global __window
-    __window = QuizletWindow()
+
+    # reuse the window so a queue keeps running while it's closed
+    if __window is None:
+        __window = QuizletWindow()
+
+    __window.show()
+    __window.raise_()
+    __window.activateWindow()
+
+
+def onProfileWillClose():
+    # the queued options hold a media folder belonging to this profile, and
+    # pending CollectionOps would land on whatever opens next
+    global __window
+
+    if __window is not None:
+        __window.shutdown()
+        __window = None
+
+
+gui_hooks.profile_will_close.append(onProfileWillClose)
 
 
 # create menu item in Anki
