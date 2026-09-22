@@ -21,7 +21,9 @@ Supports start and stop phrases. It allows you to download a part of the quizlet
 
 ![image](https://github.com/sviatoslav-lebediev/anki-quizlet-importer-extended/assets/19693768/2b08ec5b-44db-4a71-9c45-488ced6f535c)
 
-The skip errors checkbox allows to skip media download errors.
+The skip errors checkbox allows to skip media download errors. A file that
+can't be downloaded is left out of the note, so cards never reference media
+that isn't in your collection.
 
 ### This addon creates two types of cards: Normal and Reverse
 

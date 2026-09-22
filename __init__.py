@@ -819,10 +819,23 @@ def fetchMedia(url, opts, suffix='', fallback=False):
 def download_media (url, file_name, headers, cookies, media_dir):
     r = tls_get(url, tls_identifier=TLS_IDENTIFIER, headers=headers, cookies=cookies)
     status_code = r.status_code if hasattr(r, "status_code") else r.getcode()
-    if status_code == 200:
-        body = r.content if hasattr(r, "content") else r.read()
-        with open(os.path.join(media_dir, file_name), 'wb') as f:
-            f.write(body)
+
+    if status_code != 200:
+        # Nothing was written, so returning the name would leave the note
+        # pointing at a file that doesn't exist. Raise instead, which lets the
+        # caller retry through the proxy and then honour the "skip errors" box.
+        if hasattr(r, "raise_for_status"):
+            r.raise_for_status()  # 4xx/5xx only
+
+        # anything else that isn't a 200 (3xx we didn't follow, 204, ...)
+        raise urllib2.HTTPError(url, status_code, "media download failed",
+                                getattr(r, "headers", None), None)
+
+    body = r.content if hasattr(r, "content") else r.read()
+
+    with open(os.path.join(media_dir, file_name), 'wb') as f:
+        f.write(body)
+
     return file_name
 
 def parseTextItem(item):
